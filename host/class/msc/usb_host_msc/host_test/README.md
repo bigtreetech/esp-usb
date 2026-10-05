@@ -3,6 +3,7 @@
 This directory contains test code for `USB Host MSC` driver. Namely:
 
 - Simple public API call with mocked USB component to test Linux build and Cmock run for this class driver
+- MBR selection with a stale sector-zero FAT BPB, raw-volume compatibility, and mount failures, using the production VFS and FatFs paths with a synthetic disk
 
 Tests are written using [Catch2](https://github.com/catchorg/Catch2) test framework, use CMock, so you must install Ruby on your machine to run them.
 
@@ -30,3 +31,5 @@ or run the executable directly:
 ```
 ./build/host_test_usb_msc.elf
 ```
+
+Run the partition-selection regressions with `./build/host_test_usb_msc.elf "[partition]"`.

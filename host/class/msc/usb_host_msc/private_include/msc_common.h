@@ -56,7 +56,7 @@ typedef struct msc_host_device {
 #ifdef MSC_HOST_BDL_API_SUPPORTED
     esp_blockdev_handle_t bdl;
     bool bdl_vfs_registered; /**< True while a VFS mount owns this device's single BDL handle.
-                               *   esp_vfs_fat_bdl_unmount() resolves the drive by BDL handle
+                               *   ff_diskio_clear_pdrv_bdl() resolves the drive by BDL handle
                                *   identity alone, so two live VFS registrations sharing one
                                *   `bdl` handle cannot be told apart; only one is allowed at a time. */
 #endif // MSC_HOST_BDL_API_SUPPORTED

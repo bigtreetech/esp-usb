@@ -21,6 +21,10 @@ else()
     list(APPEND sources src/diskio_usb.c)
 endif()
 
+if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}.${IDF_VERSION_PATCH}" VERSION_GREATER_EQUAL "6.1.0")
+    list(APPEND priv_requires vfs)
+endif()
+
 idf_component_register(SRCS ${sources}
                        INCLUDE_DIRS include include/usb # 'include/usb' is here for backwards compatibility
                        PRIV_INCLUDE_DIRS private_include include/esp_private

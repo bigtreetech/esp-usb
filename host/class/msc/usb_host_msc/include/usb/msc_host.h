@@ -251,7 +251,7 @@ esp_err_t msc_host_reset_recovery(msc_host_device_handle_t device);
  * calling it twice returns two independent handles, not the same one twice.
  *
  * msc_host_install_device() already calls this once and stores the result on
- * the device so msc_host_vfs_register() can pass it to esp_vfs_fat_bdl_mount().
+ * the device so msc_host_vfs_register() can pass it to ff_diskio_register_bdl().
  * Call it yourself to mount with IDF FatFS BDL APIs without the MSC VFS
  * helper, or to get an independent handle for other BDL consumers.
  *

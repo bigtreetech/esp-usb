@@ -19,6 +19,9 @@ typedef struct msc_host_vfs *msc_host_vfs_handle_t;           /**< VFS handle to
 /**
  * @brief Format an MSC device.
  *
+ * Formats the entire device as an unpartitioned volume, including when VFS
+ * selected an existing MBR partition for mounting.
+ *
  * @param[in] device Device handle obtained from the MSC initialization flow.
  * @param[in] mount_config FAT mount configuration used to derive the format parameters.
  * @param[in] vfs_handle Handle associated with the registered VFS instance.
@@ -36,10 +39,16 @@ esp_err_t msc_host_vfs_format(msc_host_device_handle_t device,
 /**
  * @brief Register an MSC device with the virtual file system.
  *
- * On ESP-IDF 6.0+, this calls `esp_vfs_fat_bdl_mount()` with the handle from
+ * On ESP-IDF 6.0+, this calls `ff_diskio_register_bdl()` with the handle from
  * `msc_host_get_blockdev()` (created at device install). On older IDF, it
  * registers SCSI-backed FatFS diskio callbacks (`ff_diskio_register_msc`)
  * and mounts FatFS itself.
+ *
+ * A valid MBR takes precedence over a stale FAT boot sector at LBA 0.
+ * Primary partitions are tried in table order until one mounts; only
+ * a missing filesystem advances to the next partition. Other layouts,
+ * including GPT and unpartitioned volumes, use FatFs automatic discovery.
+ * Formatting after a mount failure still formats the entire device.
  *
  * @param[in] device Device handle obtained from the MSC initialization flow.
  * @param[in] base_path Base VFS path used to access the file system.
