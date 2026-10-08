@@ -188,21 +188,29 @@ static esp_err_t msc_mass_reset(msc_host_device_handle_t dev)
  *
  * If the device implements 3 LUNs, the returned value is 2. (LUN0, LUN1, LUN2).
  *
- * This driver does not support multiple LUNs yet.
- *
  * @see USB Mass Storage Class – Bulk Only Transport, Chapter 3.2
  *
  * @param[in]  dev MSC device handle
  * @param[out] lun Maximum Logical Unit Number
  * @return esp_err_t
  */
-__attribute__((unused)) static esp_err_t msc_get_max_lun(msc_host_device_handle_t dev, uint8_t *lun)
+static esp_err_t msc_get_max_lun(msc_host_device_handle_t dev, uint8_t *lun)
 {
     msc_device_t *device = (msc_device_t *)dev;
     usb_transfer_t *xfer = device->xfer;
 
     USB_MASS_REQ_INIT_GET_MAX_LUN((usb_setup_packet_t *)xfer->data_buffer, device->config.iface_num);
-    MSC_RETURN_ON_ERROR( msc_control_transfer(device, USB_SETUP_PACKET_SIZE + 1) );
+    esp_err_t ret = msc_control_transfer(device, USB_SETUP_PACKET_SIZE + 1);
+    if (ret != ESP_OK) {
+        // Single-LUN devices are allowed to STALL GET_MAX_LUN.
+        if (ret == ESP_ERR_MSC_INTERNAL && xfer->status == USB_TRANSFER_STATUS_STALL) {
+            *lun = 0;
+            return ESP_OK;
+        }
+        return ret;
+    }
+    MSC_RETURN_ON_FALSE(xfer->actual_num_bytes == USB_SETUP_PACKET_SIZE + 1, ESP_ERR_INVALID_SIZE);
+    MSC_RETURN_ON_FALSE(xfer->data_buffer[USB_SETUP_PACKET_SIZE] <= 15, ESP_ERR_INVALID_RESPONSE);
 
     *lun = xfer->data_buffer[USB_SETUP_PACKET_SIZE];
 
@@ -298,6 +306,13 @@ static esp_err_t msc_wait_for_ready_state(msc_device_t *dev, size_t timeout_ms)
 
     do {
         err = scsi_cmd_unit_ready(dev);
+        // Automatic selection skips empty LUNs without waiting for media insertion.
+        if (dev->lun_status && !dev->lun_status->transport_error && dev->lun_status->unavailable) {
+            return err;
+        }
+        if (dev->lun != 0 && dev->lun_status && dev->lun_status->transport_error) {
+            return err == ESP_OK ? ESP_ERR_MSC_INTERNAL : err;
+        }
         if (err == ESP_OK) {
             return ESP_OK;
         } else {
@@ -522,12 +537,56 @@ esp_err_t msc_host_uninstall(void)
     return ESP_OK;
 }
 
-esp_err_t msc_host_install_device(uint8_t device_address, msc_host_device_handle_t *msc_device_handle)
+static esp_err_t msc_initialize_lun(msc_device_t *dev)
+{
+    uint32_t block_size, block_count;
+    MSC_RETURN_ON_ERROR(scsi_cmd_inquiry(dev));
+    if (dev->lun != 0 && dev->lun_status && dev->lun_status->transport_error) {
+        return ESP_ERR_MSC_INTERNAL;
+    }
+    MSC_RETURN_ON_ERROR(msc_wait_for_ready_state(dev, WAIT_FOR_READY_TIMEOUT_MS));
+    MSC_RETURN_ON_ERROR(scsi_cmd_read_capacity(dev, &block_size, &block_count));
+
+    // Validate peer-controlled block size before FatFS sizes fs->win from a
+    // truncated WORD while reads use the full uint32_t length (BBP 574).
+    MSC_RETURN_ON_FALSE(block_size >= 512 && block_size <= 4096 &&
+                        (block_size & (block_size - 1)) == 0, ESP_ERR_INVALID_SIZE);
+    dev->disk.block_size = block_size;
+    dev->disk.block_count = block_count;
+    return ESP_OK;
+}
+
+static esp_err_t msc_select_lun(msc_device_t *dev, msc_lun_status_t *status, esp_err_t lun0_error)
+{
+    // A failed command is not enough: fallback needs an explicit media/LUN
+    // result and a completed BOT exchange, including REQUEST SENSE.
+    if (status->transport_error || !status->unavailable) {
+        return lun0_error;
+    }
+    uint8_t max_lun;
+    MSC_RETURN_ON_ERROR(msc_get_max_lun(dev, &max_lun));
+    for (uint8_t lun = 1; lun <= max_lun; lun++) {
+        dev->lun = lun;
+        *status = (msc_lun_status_t) {
+            0
+        };
+        esp_err_t ret = msc_initialize_lun(dev);
+        if (status->transport_error) {
+            return ret == ESP_OK ? ESP_ERR_MSC_INTERNAL : ret;
+        }
+        if (ret == ESP_OK || !status->unavailable) {
+            return ret;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+static esp_err_t msc_install_device(uint8_t device_address, bool auto_lun, msc_host_device_handle_t *msc_device_handle)
 {
     esp_err_t ret;
-    uint32_t block_size, block_count;
     const usb_config_desc_t *config_desc;
     msc_device_t *msc_device;
+    msc_lun_status_t lun_status = { 0 };
 
     MSC_GOTO_ON_FALSE( msc_device = calloc(1, sizeof(msc_device_t)), ESP_ERR_NO_MEM );
 
@@ -547,19 +606,13 @@ esp_err_t msc_host_install_device(uint8_t device_address, msc_host_device_handle
                            msc_device->handle,
                            msc_device->config.iface_num, 0) );
 
-    MSC_GOTO_ON_ERROR( scsi_cmd_inquiry(msc_device) );
-    MSC_GOTO_ON_ERROR( msc_wait_for_ready_state(msc_device, WAIT_FOR_READY_TIMEOUT_MS) );
-    MSC_GOTO_ON_ERROR( scsi_cmd_read_capacity(msc_device, &block_size, &block_count) );
-
-    // Validate peer-controlled block size before FatFS sizes fs->win from a
-    // truncated WORD while reads use the full uint32_t length (BBP 574).
-    MSC_GOTO_ON_FALSE(block_size >= 512 &&
-                      block_size <= 4096 &&
-                      (block_size & (block_size - 1)) == 0,
-                      ESP_ERR_INVALID_SIZE);
-
-    msc_device->disk.block_size = block_size;
-    msc_device->disk.block_count = block_count;
+    msc_device->lun_status = auto_lun ? &lun_status : NULL;
+    ret = msc_initialize_lun(msc_device);
+    if (auto_lun && ret != ESP_OK) {
+        ret = msc_select_lun(msc_device, &lun_status, ret);
+    }
+    msc_device->lun_status = NULL;
+    MSC_GOTO_ON_ERROR(ret);
 #ifdef MSC_HOST_BDL_API_SUPPORTED
     /* Allocate the BDL handle now; msc_host_vfs_register() mounts it. */
     MSC_GOTO_ON_ERROR(msc_host_get_blockdev(msc_device, &msc_device->bdl));
@@ -571,6 +624,18 @@ esp_err_t msc_host_install_device(uint8_t device_address, msc_host_device_handle
 fail:
     msc_deinit_device(msc_device, true);
     return ret;
+}
+
+esp_err_t msc_host_install_device(uint8_t device_address, msc_host_device_handle_t *msc_device_handle)
+{
+    return msc_install_device(device_address, false, msc_device_handle);
+}
+
+esp_err_t msc_host_install_device_auto(uint8_t device_address, msc_host_device_handle_t *msc_device_handle)
+{
+    MSC_RETURN_ON_INVALID_ARG(msc_device_handle);
+    *msc_device_handle = NULL;
+    return msc_install_device(device_address, true, msc_device_handle);
 }
 
 esp_err_t msc_host_uninstall_device(msc_host_device_handle_t device)
@@ -629,6 +694,7 @@ esp_err_t msc_host_get_device_info(msc_host_device_handle_t device, msc_host_dev
     info->idVendor = desc->idVendor;
     info->sector_size = dev->disk.block_size;
     info->sector_count = dev->disk.block_count;
+    info->lun = dev->lun;
 
     copy_string_desc(info->iManufacturer, dev_info.str_desc_manufacturer);
     copy_string_desc(info->iProduct, dev_info.str_desc_product);

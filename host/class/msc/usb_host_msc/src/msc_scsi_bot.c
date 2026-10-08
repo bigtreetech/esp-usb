@@ -270,13 +270,32 @@ esp_err_t bot_execute_command(msc_device_t *device, msc_cbw_t *cbw, void *data, 
 {
     msc_csw_t csw;
     msc_endpoint_t ep = (cbw->flags & CWB_FLAG_DIRECTION_IN) ? MSC_EP_IN : MSC_EP_OUT;
+    msc_lun_status_t *lun_status = device->lun_status;
+    bool transport_error = lun_status && lun_status->transport_error;
+
+    cbw->lun = device->lun;
+    if (lun_status) {
+        // Observe initialization without changing the established command or recovery sequence.
+        lun_status->transport_error = true;
+        lun_status->command_failed = false;
+        lun_status->data_bytes = 0;
+        if (((const uint8_t *)cbw)[sizeof(*cbw)] != SCSI_CMD_REQUEST_SENSE) {
+            lun_status->unavailable = false;
+        }
+    }
 
     // 1. Command transport
     MSC_RETURN_ON_ERROR( msc_bulk_transfer(device, (uint8_t *)cbw, CBW_SIZE, MSC_EP_OUT) );
+    if (lun_status && device->xfer->actual_num_bytes != CBW_SIZE) {
+        transport_error = true;
+    }
 
     // 2. Optional data transport
     if (data) {
         MSC_RETURN_ON_ERROR( msc_bulk_transfer(device, (uint8_t *)data, size, ep) );
+        if (lun_status) {
+            lun_status->data_bytes = device->xfer->actual_num_bytes;
+        }
     }
 
     // 3. Status transport
@@ -284,6 +303,7 @@ esp_err_t bot_execute_command(msc_device_t *device, msc_cbw_t *cbw, void *data, 
 
     // 3.1 Error recovery
     if (err == ESP_ERR_MSC_STALL) {
+        transport_error = true;
         // In case of the status transport failure, we can try reading the status again after clearing feature
         ESP_RETURN_ON_ERROR( clear_feature(device, device->config.bulk_in_ep), TAG, "Clear feature failed" );
         err = msc_bulk_transfer(device, (uint8_t *)&csw, sizeof(msc_csw_t), MSC_EP_IN);
@@ -295,6 +315,13 @@ esp_err_t bot_execute_command(msc_device_t *device, msc_cbw_t *cbw, void *data, 
     }
 
     MSC_RETURN_ON_ERROR(err);
+
+    if (lun_status && device->xfer->actual_num_bytes == sizeof(csw) &&
+            csw.signature == CSW_SIGNATURE && csw.tag == cbw->tag &&
+            csw.dataResidue <= cbw->data_length && csw.status <= 1) {
+        lun_status->transport_error = transport_error;
+        lun_status->command_failed = csw.status == 1;
+    }
 
     return check_csw(&csw, cbw->tag);
 }
@@ -422,6 +449,8 @@ esp_err_t scsi_cmd_sense(msc_host_device_handle_t dev, scsi_sense_data_t *sense)
 {
     msc_device_t *device = (msc_device_t *)dev;
     cbw_sense_response_t response;
+    msc_lun_status_t *lun_status = device->lun_status;
+    const bool command_failed = lun_status && lun_status->command_failed;
 
     cbw_sense_t cbw = {
         CBW_BASE_INIT(IN_DIR, CBW_CMD_SIZE(cbw_sense_t), sizeof(response)),
@@ -430,6 +459,16 @@ esp_err_t scsi_cmd_sense(msc_host_device_handle_t dev, scsi_sense_data_t *sense)
     };
 
     MSC_RETURN_ON_ERROR( bot_execute_command(device, &cbw.base, &response, sizeof(response)) );
+
+    if (command_failed && !lun_status->transport_error && lun_status->data_bytes >= 14) {
+        const uint8_t response_code = response.error_code & ~CMD_SENSE_VALID_BIT;
+        if ((response_code == 0x70 || response_code == 0x71) && response.sense_len >= 6) {
+            const uint8_t sense_key = response.sense_key & 0x0F;
+            // A second REQUEST SENSE in the ready-state loop must not erase the first result.
+            lun_status->unavailable = (sense_key == 0x02 && response.sense_code == 0x3A) ||
+                                      (sense_key == 0x05 && response.sense_code == 0x25 && response.sense_code_qualifier == 0);
+        }
+    }
 
     if (sense == NULL) {
         ESP_LOGE(TAG, "Sense error codes: Sense Key 0x%02"PRIx8", ASC: 0x%02"PRIx8", ASCQ: 0x%02"PRIx8"",

@@ -93,6 +93,7 @@ typedef struct {
     wchar_t iManufacturer[MSC_STR_DESC_SIZE];  /*!< Manufacturer string. */
     wchar_t iProduct[MSC_STR_DESC_SIZE];       /*!< Product string. */
     wchar_t iSerialNumber[MSC_STR_DESC_SIZE];  /*!< Serial number string. */
+    uint8_t lun;                             /*!< Logical unit selected during installation. */
 } msc_host_device_info_t;
 
 /**
@@ -133,9 +134,41 @@ esp_err_t msc_host_uninstall(void);
 esp_err_t msc_host_install_device(uint8_t device_address, msc_host_device_handle_t *device);
 
 /**
+ * @brief Initialize an MSC device, preferring LUN 0 and falling back to other LUNs.
+ *
+ * Tries LUN 0 first. Only a failed initialization with valid sense data
+ * reporting no medium or an unsupported LUN allows
+ * discovery of other LUNs. The driver then queries GET_MAX_LUN and tries the
+ * remaining LUNs in ascending order, keeping the same USB device and interface
+ * open. The first LUN that initializes successfully is selected for all I/O.
+ *
+ * USB/BOT errors, unsupported capacity, and other initialization failures stop
+ * selection. Filesystem mounting is separate and never triggers LUN fallback.
+ * LUNs reporting no medium or an unsupported LUN are skipped immediately,
+ * including LUN 0. Other readiness states retain the original retries and timeout.
+ *
+ * @note Call outside the MSC event callback, while USB event processing continues.
+ *       Serialize device installation and uninstallation in the application.
+ *       No preliminary reset or endpoint synchronization requests are sent.
+ *       Insert media before installation. On failure, no session is retained;
+ *       reconnect before retrying if SCSI commands have already been sent.
+ *
+ * @param[in] device_address Device address obtained from the MSC connection callback.
+ * @param[out] device Selected device handle on success; NULL on failure.
+ *
+ * @return
+ *      - ESP_OK on success
+ *      - ESP_ERR_INVALID_ARG if device is NULL
+ *      - ESP_ERR_NOT_FOUND if all advertised LUNs report no medium or are unsupported
+ *      - ESP_ERR_INVALID_SIZE or ESP_ERR_INVALID_RESPONSE for malformed GET_MAX_LUN
+ *      - Other errors from initialization or the USB transport
+ */
+esp_err_t msc_host_install_device_auto(uint8_t device_address, msc_host_device_handle_t *device);
+
+/**
  * @brief Deinitialize an MSC device.
  *
- * @param[in] device Device handle obtained from msc_host_install_device().
+ * @param[in] device Device handle obtained from either installation function.
  *
  * @return
  *      - ESP_OK on success

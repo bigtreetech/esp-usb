@@ -46,12 +46,23 @@ typedef struct {
     uint8_t iface_num;
 } msc_config_t;
 
+// Observations used only while automatically selecting a LUN. Recording them
+// must not change SCSI command execution or error recovery.
+typedef struct {
+    bool transport_error;
+    bool command_failed;
+    bool unavailable;
+    size_t data_bytes;
+} msc_lun_status_t;
+
 typedef struct msc_host_device {
     STAILQ_ENTRY(msc_host_device) tailq_entry;
     SemaphoreHandle_t transfer_done;
     usb_device_handle_t handle;
     usb_transfer_t *xfer;
     msc_config_t config;
+    uint8_t lun;
+    msc_lun_status_t *lun_status;
     usb_disk_t disk;
 #ifdef MSC_HOST_BDL_API_SUPPORTED
     esp_blockdev_handle_t bdl;

@@ -42,6 +42,28 @@ Volume selection does not write to the device. `msc_host_vfs_format()` and `form
 - At this point, standard C functions for accessing storage (`fopen`, `fwrite`, `fread`, `mkdir` etc.) can be carried out.
 - In order to uninstall the whole USB stack, deinitializing counterparts to functions above has to be called in reverse order.
 
+## Automatic LUN selection
+
+`msc_host_install_device_auto()` tries LUN 0 first, using the existing SCSI commands and error recovery. If LUN 0 initializes successfully, it is used without querying or probing other LUNs. `msc_host_install_device()` continues to install only LUN 0 with its original readiness wait.
+
+Only a failed initialization with valid sense reporting no medium (`02/3A/xx`) or an unsupported LUN (`05/25/00`) permits fallback. Such LUNs, including LUN 0, are skipped immediately without waiting for media to become available. The driver then queries `GET_MAX_LUN` and tries the remaining advertised LUNs in ascending order. Discovery and installation use the same USB device, interface and transfers; no preliminary reset, endpoint synchronization or interface re-claim is added. A legal `GET_MAX_LUN` STALL means the device advertises only LUN 0.
+
+USB/BOT errors, unsupported capacity and other initialization failures stop selection. The selected LUN remains fixed for all I/O and recovery until uninstall, and is reported by `msc_host_device_info_t.lun`. Filesystem mounting remains separate: a damaged or unsupported filesystem does not cause the driver to choose a different LUN.
+
+Replace the installation call in the application; keep the existing VFS mount and cleanup calls:
+
+```c
+msc_host_device_handle_t device = NULL;
+esp_err_t err = msc_host_install_device_auto(address, &device);
+if (err != ESP_OK) {
+    return err;
+}
+```
+
+Run installation outside the MSC event callback while another task continues USB event processing. Serialize installation and uninstallation. Other readiness states, such as becoming ready or Unit Attention, retain the existing retries and timeout for each LUN.
+
+Insert media before installation. If no LUN is available, installation returns `ESP_ERR_NOT_FOUND` and releases its resources; it does not retain a discovery session. After a failed installation that sent SCSI commands, reconnect the reader before retrying, because reopening a host interface does not reset the device's transport state.
+
 ## Performance tuning
 
 The following performance tuning options have significant impact on data throughput in USB HighSpeed implementations. For original FullSpeed implementations, the effects are negligible.

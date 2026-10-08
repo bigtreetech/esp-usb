@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Add LUN 0-first automatic installation, immediately trying another advertised LUN in the same USB session after a confirmed no-medium or unsupported-LUN failure
+
 ### Fixed
 
 - Fix mounting an obsolete sector-zero FAT volume when the device has a valid MBR partition table

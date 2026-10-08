@@ -3,6 +3,7 @@
 This directory contains test code for `USB Host MSC` driver. Namely:
 
 - Simple public API call with mocked USB component to test Linux build and Cmock run for this class driver
+- LUN 0 command-sequence compatibility, same-session automatic fallback, selected-LUN I/O, and rejection of fallback after USB/BOT or unrelated SCSI errors
 - MBR selection with a stale sector-zero FAT BPB, raw-volume compatibility, and mount failures, using the production VFS and FatFs paths with a synthetic disk
 
 Tests are written using [Catch2](https://github.com/catchorg/Catch2) test framework, use CMock, so you must install Ruby on your machine to run them.
