@@ -103,6 +103,9 @@ public:
     scsi_sense_data_t inquiry_sense = {0x05, 0x25, 0x00}; // LOGICAL UNIT NOT SUPPORTED
     scsi_sense_data_t readiness_sense_once = {};
     bool fail_read = false, fail_sense = false, cancel_inquiry_data = false;
+    unsigned write_crc_failures = 0;
+    unsigned write_csw_transport_failures = 0;
+    scsi_sense_data_t write_failure_sense = {0x0B, 0x47, 0x01};
     int transport_error_opcode = -1, transport_error_lun = 0;
     CswFault csw_fault = CswFault::NONE;
     uint8_t fault_opcode = INQUIRY, fault_lun = 0;
@@ -115,6 +118,7 @@ public:
     unsigned get_max_count = 0, reset_count = 0, clear_count = 0;
     size_t transfer_bytes = 0, transfer_budget = SIZE_MAX;
     std::vector<uint16_t> commands; // High byte: LUN, low byte: opcode.
+    std::vector<uint32_t> command_tags;
 
     unsigned count(uint8_t lun, uint8_t opcode) const
     {
@@ -241,6 +245,7 @@ private:
             f.opcode = data[15];
             REQUIRE(f.lun < 16);
             f.commands.push_back((f.lun << 8) | f.opcode);
+            f.command_tags.push_back(f.tag);
             f.status = 0;
             if (f.lun == f.transport_error_lun && f.opcode == f.transport_error_opcode) {
                 transfer->status = USB_TRANSFER_STATUS_ERROR;
@@ -265,6 +270,10 @@ private:
             } else if (f.opcode == READ10 && f.fail_read) {
                 f.status = 1;
                 f.sense = {0x03, 0x11, 0x00};
+            } else if (f.opcode == WRITE10 && f.write_crc_failures != 0) {
+                --f.write_crc_failures;
+                f.status = 1;
+                f.sense = f.write_failure_sense;
             }
             f.phase = f.data_length ? DATA : CSW;
         } else if (f.phase == DATA) {
@@ -306,6 +315,14 @@ private:
             f.phase = CSW;
         } else {
             CHECK(transfer->bEndpointAddress == 0x81);
+            if (f.opcode == WRITE10 && f.write_csw_transport_failures != 0) {
+                --f.write_csw_transport_failures;
+                f.phase = CBW;
+                transfer->status = USB_TRANSFER_STATUS_ERROR;
+                transfer->actual_num_bytes = 0;
+                transfer->callback(transfer);
+                return ESP_OK;
+            }
             std::memcpy(data, "USBS", 4);
             std::memcpy(data + 4, &f.tag, sizeof(f.tag));
             std::fill_n(data + 8, 4, 0);
@@ -577,4 +594,120 @@ TEST_CASE_METHOD(LunFallbackFixture, "MSC grows its transfer buffer within the a
     REQUIRE(transfer_bytes == 512);
     REQUIRE(ESP_OK == __real_scsi_cmd_read10(device, data, 0, 2, 512));
     CHECK(transfer_bytes == 1024);
+}
+
+TEST_CASE_METHOD(LunFallbackFixture, "MSC retries one WRITE10 current data-phase CRC error", "[msc][write][retry]")
+{
+    REQUIRE(ESP_OK == msc_host_install_device(1, &device));
+    commands.clear();
+    command_tags.clear();
+    write_crc_failures = 1;
+
+    uint8_t sector[512] = {};
+    REQUIRE(ESP_OK == __real_scsi_cmd_write10(device, sector, 0, 1, sizeof(sector)));
+
+    const std::vector<uint16_t> expected = {
+        WRITE10, REQUEST_SENSE, TEST_UNIT_READY, WRITE10
+    };
+    CHECK(commands == expected);
+    CHECK(reset_count == 1);
+    CHECK(clear_count == 2);
+    REQUIRE(command_tags.size() == 4);
+    CHECK(command_tags[0] != command_tags[3]);
+}
+
+TEST_CASE_METHOD(LunFallbackFixture, "MSC recovers a WRITE10 status transport failure with current CRC sense", "[msc][write][retry]")
+{
+    REQUIRE(ESP_OK == msc_host_install_device(1, &device));
+    commands.clear();
+    command_tags.clear();
+    write_crc_failures = 1;
+    write_csw_transport_failures = 1;
+
+    uint8_t sector[512] = {};
+    REQUIRE(ESP_OK == __real_scsi_cmd_write10(device, sector, 0, 1, sizeof(sector)));
+
+    const std::vector<uint16_t> expected = {
+        WRITE10, REQUEST_SENSE, TEST_UNIT_READY, WRITE10
+    };
+    CHECK(commands == expected);
+    CHECK(reset_count == 1);
+    CHECK(clear_count == 2);
+    CHECK(count(0, WRITE10) == 2);
+}
+
+TEST_CASE_METHOD(LunFallbackFixture, "MSC does not retry WRITE10 for deferred or incomplete sense", "[msc][write][retry]")
+{
+    REQUIRE(ESP_OK == msc_host_install_device(1, &device));
+    commands.clear();
+    command_tags.clear();
+    write_crc_failures = 1;
+
+    SECTION("Deferred error") {
+        sense_response_code = 0x71;
+    }
+    SECTION("Invalid response code") {
+        sense_response_code = 0;
+    }
+    SECTION("Truncated fixed sense") {
+        sense_length = 8;
+    }
+    SECTION("Current non-CRC error") {
+        write_failure_sense = {0x07, 0x27, 0x00};
+    }
+
+    uint8_t sector[512] = {};
+    CHECK(ESP_OK != __real_scsi_cmd_write10(device, sector, 0, 1, sizeof(sector)));
+    const std::vector<uint16_t> expected = {WRITE10, REQUEST_SENSE};
+    CHECK(commands == expected);
+}
+
+TEST_CASE_METHOD(LunFallbackFixture, "MSC does not retry WRITE10 without a valid command-failed CSW", "[msc][write][retry]")
+{
+    REQUIRE(ESP_OK == msc_host_install_device(1, &device));
+    commands.clear();
+    command_tags.clear();
+    write_crc_failures = 1;
+    fault_opcode = WRITE10;
+
+    SECTION("Malformed signature") {
+        csw_fault = CswFault::SIGNATURE;
+    }
+    SECTION("Mismatched tag") {
+        csw_fault = CswFault::TAG;
+    }
+    SECTION("Short CSW") {
+        csw_fault = CswFault::SHORT;
+    }
+    SECTION("Phase error") {
+        csw_fault = CswFault::PHASE;
+    }
+    SECTION("Reserved status") {
+        csw_fault = CswFault::RESERVED_STATUS;
+    }
+    SECTION("USB transport error") {
+        transport_error_opcode = WRITE10;
+    }
+
+    uint8_t sector[512] = {};
+    CHECK(ESP_OK != __real_scsi_cmd_write10(device, sector, 0, 1, sizeof(sector)));
+    CHECK(count(0, WRITE10) == 1);
+}
+
+TEST_CASE_METHOD(LunFallbackFixture, "MSC bounds WRITE10 CRC recovery to one retry", "[msc][write][retry]")
+{
+    REQUIRE(ESP_OK == msc_host_install_device(1, &device));
+    commands.clear();
+    command_tags.clear();
+    write_crc_failures = 2;
+
+    uint8_t sector[512] = {};
+    CHECK(ESP_OK != __real_scsi_cmd_write10(device, sector, 0, 1, sizeof(sector)));
+    const std::vector<uint16_t> expected = {
+        WRITE10, REQUEST_SENSE, TEST_UNIT_READY, WRITE10, REQUEST_SENSE
+    };
+    CHECK(commands == expected);
+    CHECK(count(0, WRITE10) == 2);
+    CHECK(reset_count == 1);
+    CHECK(clear_count == 2);
 }

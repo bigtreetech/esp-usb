@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Fix mounting an obsolete sector-zero FAT volume when the device has a valid MBR partition table
 - Fix READ CAPACITY(10) off-by-one: the last accessible LBA was used as a block count, under-reporting device capacity by one block
+- Retry one WRITE10 only after a valid matching Command Failed CSW and a current fixed-format `0B/47/01` sense, using the same LBA and payload while leaving deferred and transport errors unchanged
 
 ## [1.3.0] - 2026-09-14
 

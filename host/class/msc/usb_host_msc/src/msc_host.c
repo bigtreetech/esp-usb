@@ -544,7 +544,12 @@ static esp_err_t msc_initialize_lun(msc_device_t *dev)
     if (dev->lun != 0 && dev->lun_status && dev->lun_status->transport_error) {
         return ESP_ERR_MSC_INTERNAL;
     }
-    MSC_RETURN_ON_ERROR(msc_wait_for_ready_state(dev, WAIT_FOR_READY_TIMEOUT_MS));
+    /* A not-ready LUN is an expected result during automatic LUN selection.
+     * Return it to the selector without emitting an error at this layer. */
+    esp_err_t err = msc_wait_for_ready_state(dev, WAIT_FOR_READY_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        return err;
+    }
     MSC_RETURN_ON_ERROR(scsi_cmd_read_capacity(dev, &block_size, &block_count));
 
     // Validate peer-controlled block size before FatFS sizes fs->win from a
