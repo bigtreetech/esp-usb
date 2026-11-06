@@ -544,7 +544,12 @@ static esp_err_t msc_initialize_lun(msc_device_t *dev)
     if (dev->lun != 0 && dev->lun_status && dev->lun_status->transport_error) {
         return ESP_ERR_MSC_INTERNAL;
     }
-    MSC_RETURN_ON_ERROR(msc_wait_for_ready_state(dev, WAIT_FOR_READY_TIMEOUT_MS));
+    /* A not-ready LUN is an expected result during automatic LUN selection.
+     * Return it to the selector without emitting an error at this layer. */
+    esp_err_t err = msc_wait_for_ready_state(dev, WAIT_FOR_READY_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        return err;
+    }
     MSC_RETURN_ON_ERROR(scsi_cmd_read_capacity(dev, &block_size, &block_count));
 
     // Validate peer-controlled block size before FatFS sizes fs->win from a
@@ -805,7 +810,7 @@ esp_err_t msc_control_transfer(msc_device_t *device, size_t len)
     return wait_for_transfer_done(xfer) == USB_TRANSFER_STATUS_COMPLETED ? ESP_OK : ESP_ERR_MSC_INTERNAL;
 }
 
-esp_err_t msc_host_reset_recovery(msc_host_device_handle_t device)
+esp_err_t msc_bot_reset_recovery(msc_device_t *device)
 {
     // USB Mass Storage Class – Bulk Only Transport Revision 1.0
     // 5.3.4 Reset Recovery
@@ -814,10 +819,33 @@ esp_err_t msc_host_reset_recovery(msc_host_device_handle_t device)
     // (b) a Clear Feature HALT to the Bulk-In endpoint
     // (c) a Clear Feature HALT to the Bulk-Out endpoint
 
-    ESP_RETURN_ON_ERROR( msc_mass_reset(device), TAG, "Mass reset failed" );
-    // Clear feature will fail if there is not STALL on the endpoint, so we don't check the errors here
-    clear_feature(device, device->config.bulk_in_ep);
-    clear_feature(device, device->config.bulk_out_ep);
+    // All three requests are required in order. Preserve the first error, but
+    // still complete the sequence so both bulk pipes are left in the best
+    // recoverable state possible.
+    esp_err_t first_err = msc_mass_reset(device);
+    if (first_err != ESP_OK) {
+        ESP_LOGE(TAG, "Mass reset failed: %s", esp_err_to_name(first_err));
+    }
+    esp_err_t bulk_in_err = clear_feature(device, device->config.bulk_in_ep);
+    if (bulk_in_err != ESP_OK) {
+        ESP_LOGE(TAG, "Clear Bulk-In halt failed: %s", esp_err_to_name(bulk_in_err));
+        if (first_err == ESP_OK) {
+            first_err = bulk_in_err;
+        }
+    }
+    esp_err_t bulk_out_err = clear_feature(device, device->config.bulk_out_ep);
+    if (bulk_out_err != ESP_OK) {
+        ESP_LOGE(TAG, "Clear Bulk-Out halt failed: %s", esp_err_to_name(bulk_out_err));
+        if (first_err == ESP_OK) {
+            first_err = bulk_out_err;
+        }
+    }
+    return first_err;
+}
+
+esp_err_t msc_host_reset_recovery(msc_host_device_handle_t device)
+{
+    MSC_RETURN_ON_ERROR(msc_bot_reset_recovery(device));
     MSC_RETURN_ON_ERROR( msc_wait_for_ready_state(device, WAIT_FOR_READY_TIMEOUT_MS) );
     return ESP_OK;
 }

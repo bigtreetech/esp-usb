@@ -106,6 +106,14 @@ esp_err_t msc_control_transfer(msc_device_t *device_handle, size_t len);
  */
 esp_err_t clear_feature(msc_device_t *device, uint8_t endpoint);
 
+/**
+ * @brief Restore BOT synchronization without issuing another SCSI command
+ *
+ * @param[in] device MSC device handle
+ * @return esp_err_t
+ */
+esp_err_t msc_bot_reset_recovery(msc_device_t *device);
+
 #define MSC_GOTO_ON_ERROR(exp) ESP_GOTO_ON_ERROR(exp, fail, TAG, "")
 
 #define MSC_GOTO_ON_FALSE(exp, err) ESP_GOTO_ON_FALSE( (exp), err, fail, TAG, "" )
