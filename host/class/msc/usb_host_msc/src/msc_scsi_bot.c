@@ -86,7 +86,6 @@ typedef struct {
 const sense_errors_t sense_errors_lut[] = {
     {0x00, 0x00, 0x00, "NO SENSE"},
     {0x07, 0x27, 0x00, "WRITE PROTECTED MEDIA"},
-
     // add more items as needed
 };
 
@@ -233,6 +232,19 @@ typedef struct __attribute__((packed))
 // Unique number based on which MSC protocol pairs request and response
 static uint32_t cbw_tag;
 
+typedef struct {
+    bool transport_ok;
+    bool csw_valid;
+    uint8_t csw_status;
+    size_t data_bytes;
+} bot_command_result_t;
+
+static esp_err_t bot_reset_after_error(msc_device_t *device, esp_err_t command_err)
+{
+    esp_err_t recovery_err = msc_bot_reset_recovery(device);
+    return recovery_err == ESP_OK ? command_err : recovery_err;
+}
+
 static esp_err_t check_csw(msc_csw_t *csw, uint32_t tag)
 {
     const bool csw_ok = csw->signature == CSW_SIGNATURE && csw->tag == tag &&
@@ -266,12 +278,21 @@ static esp_err_t check_csw(msc_csw_t *csw, uint32_t tag)
  * @param[in] size   Size of data in bytes
  * @return esp_err_t
  */
-esp_err_t bot_execute_command(msc_device_t *device, msc_cbw_t *cbw, void *data, size_t size)
+static esp_err_t bot_execute_command_with_result(msc_device_t *device,
+                                                  msc_cbw_t *cbw, void *data,
+                                                  size_t size,
+                                                  bot_command_result_t *result)
 {
-    msc_csw_t csw;
+    msc_csw_t csw = { 0 };
     msc_endpoint_t ep = (cbw->flags & CWB_FLAG_DIRECTION_IN) ? MSC_EP_IN : MSC_EP_OUT;
     msc_lun_status_t *lun_status = device->lun_status;
     bool transport_error = lun_status && lun_status->transport_error;
+    bool command_transport_error = false;
+    size_t data_bytes = 0;
+
+    if (result) {
+        *result = (bot_command_result_t) { 0 };
+    }
 
     cbw->lun = device->lun;
     if (lun_status) {
@@ -285,36 +306,74 @@ esp_err_t bot_execute_command(msc_device_t *device, msc_cbw_t *cbw, void *data, 
     }
 
     // 1. Command transport
-    MSC_RETURN_ON_ERROR( msc_bulk_transfer(device, (uint8_t *)cbw, CBW_SIZE, MSC_EP_OUT) );
-    if (lun_status && device->xfer->actual_num_bytes != CBW_SIZE) {
-        transport_error = true;
+    esp_err_t err = msc_bulk_transfer(device, (uint8_t *)cbw, CBW_SIZE, MSC_EP_OUT);
+    if (err != ESP_OK) {
+        return bot_reset_after_error(device, err);
+    }
+    if (device->xfer->actual_num_bytes != CBW_SIZE) {
+        return bot_reset_after_error(device, ESP_ERR_INVALID_RESPONSE);
     }
 
     // 2. Optional data transport
     if (data) {
-        MSC_RETURN_ON_ERROR( msc_bulk_transfer(device, (uint8_t *)data, size, ep) );
+        err = msc_bulk_transfer(device, (uint8_t *)data, size, ep);
+        data_bytes = device->xfer->actual_num_bytes;
         if (lun_status) {
-            lun_status->data_bytes = device->xfer->actual_num_bytes;
+            lun_status->data_bytes = data_bytes;
+        }
+        if (err == ESP_ERR_MSC_STALL) {
+            transport_error = true;
+            command_transport_error = true;
+            uint8_t endpoint = ep == MSC_EP_IN ? device->config.bulk_in_ep : device->config.bulk_out_ep;
+            esp_err_t clear_err = clear_feature(device, endpoint);
+            if (clear_err != ESP_OK) {
+                return bot_reset_after_error(device, clear_err);
+            }
+        } else if (err != ESP_OK) {
+            return bot_reset_after_error(device, err);
         }
     }
 
     // 3. Status transport
-    esp_err_t err = msc_bulk_transfer(device, (uint8_t *)&csw, sizeof(msc_csw_t), MSC_EP_IN);
+    err = msc_bulk_transfer(device, (uint8_t *)&csw, sizeof(msc_csw_t), MSC_EP_IN);
 
     // 3.1 Error recovery
     if (err == ESP_ERR_MSC_STALL) {
-        transport_error = true;
-        // In case of the status transport failure, we can try reading the status again after clearing feature
-        ESP_RETURN_ON_ERROR( clear_feature(device, device->config.bulk_in_ep), TAG, "Clear feature failed" );
-        err = msc_bulk_transfer(device, (uint8_t *)&csw, sizeof(msc_csw_t), MSC_EP_IN);
-        if (ESP_OK != err) {
-            // In case the repeated status transport failed we do reset recovery
-            // We don't check the error code here, the command has already failed.
-            msc_host_reset_recovery(device);
+        // BOT 5.3.3 permits one CSW retry after clearing a Bulk-In STALL. A
+        // valid CSW from that retry restores a known command result; only a
+        // failed retry leaves the status unknown and requires Reset Recovery.
+        esp_err_t clear_err = clear_feature(device, device->config.bulk_in_ep);
+        if (clear_err != ESP_OK) {
+            return bot_reset_after_error(device, clear_err);
         }
+        err = msc_bulk_transfer(device, (uint8_t *)&csw, sizeof(msc_csw_t), MSC_EP_IN);
     }
 
-    MSC_RETURN_ON_ERROR(err);
+    if (err != ESP_OK) {
+        // The command status is unknown. Restore BOT synchronization before
+        // allowing another CBW, but do not issue SCSI commands from recovery.
+        if (result) {
+            result->data_bytes = data_bytes;
+        }
+        return bot_reset_after_error(device, err);
+    }
+
+    const bool csw_valid = device->xfer->actual_num_bytes == sizeof(csw) &&
+                           csw.signature == CSW_SIGNATURE &&
+                           csw.tag == cbw->tag &&
+                           csw.dataResidue <= cbw->data_length &&
+                           csw.status <= 2;
+    if (result) {
+        result->transport_ok = !command_transport_error;
+        result->csw_valid = csw_valid;
+        result->csw_status = csw.status;
+        result->data_bytes = data_bytes;
+    }
+
+    if (!csw_valid || csw.status == 2) {
+        // Invalid CSWs and Phase Error require Reset Recovery before the next CBW.
+        return bot_reset_after_error(device, ESP_FAIL);
+    }
 
     if (lun_status && device->xfer->actual_num_bytes == sizeof(csw) &&
             csw.signature == CSW_SIGNATURE && csw.tag == cbw->tag &&
@@ -323,7 +382,17 @@ esp_err_t bot_execute_command(msc_device_t *device, msc_cbw_t *cbw, void *data, 
         lun_status->command_failed = csw.status == 1;
     }
 
-    return check_csw(&csw, cbw->tag);
+    esp_err_t csw_err = check_csw(&csw, cbw->tag);
+    if (csw_err == ESP_OK && data != NULL && data_bytes != size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return csw_err;
+}
+
+esp_err_t bot_execute_command(msc_device_t *device, msc_cbw_t *cbw,
+                              void *data, size_t size)
+{
+    return bot_execute_command_with_result(device, cbw, data, size, NULL);
 }
 
 static const char *decode_sense_keys(cbw_sense_response_t *sense_response)
@@ -338,6 +407,48 @@ static const char *decode_sense_keys(cbw_sense_response_t *sense_response)
     }
 
     return "not found, refer to USB Mass Storage Class – UFI Command Specification (Table 51)";
+}
+
+static bool is_retryable_write_crc_error(const cbw_sense_response_t *response)
+{
+    return (response->sense_key & 0x0F) == 0x0B &&
+           response->sense_code == 0x47 &&
+           response->sense_code_qualifier == 0x01;
+}
+
+#ifndef MSC_WRITE10_CRC_RETRY_COUNT
+#define MSC_WRITE10_CRC_RETRY_COUNT 3
+#endif
+
+static esp_err_t scsi_cmd_current_write_sense(
+    msc_device_t *device, cbw_sense_response_t *response)
+{
+    memset(response, 0, sizeof(*response));
+    cbw_sense_t cbw = {
+        CBW_BASE_INIT(IN_DIR, CBW_CMD_SIZE(cbw_sense_t), sizeof(*response)),
+        .opcode = SCSI_CMD_REQUEST_SENSE,
+        .allocation_length = sizeof(*response),
+    };
+    bot_command_result_t result;
+    esp_err_t err = bot_execute_command_with_result(
+        device, &cbw.base, response, sizeof(*response), &result);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const uint8_t response_code = response->error_code & ~CMD_SENSE_VALID_BIT;
+    if (!result.transport_ok || !result.csw_valid ||
+            result.csw_status != 0 || result.data_bytes < 14 ||
+            response_code != 0x70 || response->sense_len < 6) {
+        ESP_LOGW(TAG,
+                 "WRITE10 retry suppressed: response=0x%02"PRIx8
+                 " bytes=%u sense_len=%u transport=%d csw_valid=%d status=%u",
+                 response_code, (unsigned)result.data_bytes,
+                 (unsigned)response->sense_len, result.transport_ok,
+                 result.csw_valid, (unsigned)result.csw_status);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
 }
 
 
@@ -387,11 +498,63 @@ esp_err_t scsi_cmd_write10(msc_host_device_handle_t dev,
         .length = __builtin_bswap16(num_sectors),
     };
 
-    esp_err_t ret = bot_execute_command(device, &cbw.base, (void *)data, num_sectors * sector_size);
-
-    // In case of an error, get an error code
+    const size_t data_size = num_sectors * sector_size;
+    bot_command_result_t write_result;
+    esp_err_t ret = bot_execute_command_with_result(
+        device, &cbw.base, (void *)data, data_size, &write_result);
     if (unlikely(ret != ESP_OK)) {
-        MSC_RETURN_ON_ERROR( scsi_cmd_sense(device, NULL));
+        const bool command_failed = write_result.transport_ok &&
+                                    write_result.csw_valid &&
+                                    write_result.csw_status == 1 &&
+                                    write_result.data_bytes == data_size;
+        if (!command_failed) {
+            return ret;
+        }
+
+        cbw_sense_response_t sense;
+        esp_err_t sense_err = scsi_cmd_current_write_sense(device, &sense);
+        if (sense_err != ESP_OK) {
+            return ret;
+        }
+
+        /* A valid Command Failed CSW leaves BOT synchronized, so retry the
+         * same LBA and payload directly after an exact current CRC sense.
+         * Keep this bounded below FatFS so a successful retry is transparent. */
+        if (is_retryable_write_crc_error(&sense)) {
+            for (unsigned retry = 0; retry < MSC_WRITE10_CRC_RETRY_COUNT; ++retry) {
+                cbw.base.tag = ++cbw_tag;
+                ret = bot_execute_command_with_result(
+                    device, &cbw.base, (void *)data, data_size, &write_result);
+                if (ret == ESP_OK) {
+                    ESP_LOGD(TAG, "WRITE10 recovered after data-phase CRC error");
+                    return ESP_OK;
+                }
+
+                const bool retry_command_failed = write_result.transport_ok &&
+                                                  write_result.csw_valid &&
+                                                  write_result.csw_status == 1 &&
+                                                  write_result.data_bytes == data_size;
+                if (!retry_command_failed) {
+                    return ret;
+                }
+
+                if (retry + 1 >= MSC_WRITE10_CRC_RETRY_COUNT) {
+                    MSC_RETURN_ON_ERROR(scsi_cmd_sense(device, NULL));
+                    return ret;
+                }
+
+                sense_err = scsi_cmd_current_write_sense(device, &sense);
+                if (sense_err != ESP_OK) {
+                    return ret;
+                }
+                if (!is_retryable_write_crc_error(&sense)) {
+                    break;
+                }
+            }
+        }
+        ESP_LOGE(TAG, "Sense error codes: Sense Key 0x%02"PRIx8", ASC: 0x%02"PRIx8", ASCQ: 0x%02"PRIx8"",
+                 sense.sense_key, sense.sense_code, sense.sense_code_qualifier);
+        ESP_LOGE(TAG, "Sense error description: %s", decode_sense_keys(&sense));
     }
     return ret;
 }
@@ -440,7 +603,11 @@ esp_err_t scsi_cmd_unit_ready(msc_host_device_handle_t dev)
 
     // In case of an error, get an error code
     if (unlikely(ret != ESP_OK)) {
-        MSC_RETURN_ON_ERROR( scsi_cmd_sense(device, NULL));
+        /* The ready-state loop requests sense again to decide whether to
+         * wait or select another LUN. Preserve that command sequence, but do
+         * not print this expected transitional sense as a device error. */
+        scsi_sense_data_t ignored_sense;
+        MSC_RETURN_ON_ERROR(scsi_cmd_sense(device, &ignored_sense));
     }
     return ret;
 }
