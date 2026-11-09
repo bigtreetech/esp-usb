@@ -87,6 +87,7 @@ public:
             .event_cb = handle_notif,
             .data_cb = handle_rx,
             .user_arg = this,
+            .disable_notification = false,
         };
 
         ESP_MODEM_THROW_IF_ERROR(

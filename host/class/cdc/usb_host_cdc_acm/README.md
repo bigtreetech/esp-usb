@@ -43,6 +43,10 @@ The following steps outline the typical API call pattern of the CDC-ACM Class Dr
 
 Use `CDC_HOST_ANY_VID`, `CDC_HOST_ANY_PID`, and `CDC_HOST_ANY_DEV_ADDR` when you do not want to filter by vendor ID, product ID, or USB device address. Wildcards are appropriate when only one matching device is expected. If several devices share the same VID and PID (for example behind a hub), fill `cdc_acm_host_open_config_t` and set `dev_addr` to the device’s USB address.
 
+To save a host channel when interrupt notifications are not needed, set `disable_notification = true` in `cdc_acm_host_open_config_t` and pass it to `cdc_acm_host_open()`. The driver skips claiming a separate notification interface. If notification and data endpoints share an interface, its endpoints are still allocated, so the channel count does not decrease. The default is `false`; the legacy VID/PID/interface form keeps notifications enabled.
+
+Disabling notifications stops `SERIAL_STATE` and `NETWORK_CONNECTION` events from the notification endpoint. Bulk data transfers, EP0 control requests, and device disconnect/suspend/resume events remain available.
+
 ## Examples
 
 - For an example with a CDC-ACM device, or Virtual COM Port device refer to [cdc example in esp-idf](https://github.com/espressif/esp-idf/tree/master/examples/peripherals/usb/host/cdc)

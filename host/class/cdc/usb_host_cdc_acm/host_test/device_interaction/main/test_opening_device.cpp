@@ -5,9 +5,13 @@
  */
 
 #include <stdio.h>
+#include <cstdlib>
+#include <vector>
 #include <catch2/catch_test_macros.hpp>
 
 #include "descriptors/cdc_descriptors.hpp"
+#include "descriptors/stm32_device.hpp"
+#include "cdc_host_descriptor_parsing.h"
 #include "usb/cdc_acm_host.h"
 #include "mock_add_usb_device.h"
 #include "common_test_fixtures.hpp"
@@ -80,6 +84,7 @@ SCENARIO("Test mocked device opening and closing")
                     .event_cb = dev_config.event_cb,
                     .data_cb = dev_config.data_cb,
                     .user_arg = dev_config.user_arg,
+                    .disable_notification = false,
                 };
                 REQUIRE(ESP_ERR_NOT_FOUND == cdc_acm_host_open(&open_cfg, &dev));
             }
@@ -125,6 +130,7 @@ SCENARIO("Test mocked device opening and closing")
                     .event_cb = dev_config.event_cb,
                     .data_cb = dev_config.data_cb,
                     .user_arg = dev_config.user_arg,
+                    .disable_notification = false,
                 };
                 const cdc_acm_host_open_config_t open_cfg_b = {
                     .vid = vid,
@@ -137,6 +143,7 @@ SCENARIO("Test mocked device opening and closing")
                     .event_cb = dev_config.event_cb,
                     .data_cb = dev_config.data_cb,
                     .user_arg = dev_config.user_arg,
+                    .disable_notification = false,
                 };
 
                 test_usb_host_interface_claim(interface_index);
@@ -197,6 +204,7 @@ SCENARIO("Test mocked device opening and closing")
                         .event_cb = dev_config.event_cb,
                         .data_cb = dev_config.data_cb,
                         .user_arg = dev_config.user_arg,
+                        .disable_notification = false,
                     };
                     REQUIRE(ESP_OK == cdc_acm_host_open(&open_cfg, &dev));
                     REQUIRE(nullptr != dev);
@@ -214,6 +222,7 @@ SCENARIO("Test mocked device opening and closing")
                         .event_cb = dev_config.event_cb,
                         .data_cb = dev_config.data_cb,
                         .user_arg = dev_config.user_arg,
+                        .disable_notification = false,
                     };
                     REQUIRE(ESP_OK == cdc_acm_host_open(&open_cfg, &dev));
                     REQUIRE(nullptr != dev);
@@ -312,4 +321,107 @@ SCENARIO("Test usb_host_transfer_alloc() failures")
 
         REQUIRE(ESP_OK == test_cdc_acm_host_uninstall());
     }
+}
+
+TEST_CASE("CDC notification polling can be disabled", "[cdc][notification]")
+{
+    bool legacy_open = false;
+    bool disable_notification = false;
+    bool shared_interface = false;
+    SECTION("Legacy open keeps notifications enabled") {
+        legacy_open = true;
+    }
+    SECTION("Zero-initialized open configuration keeps notifications enabled") {}
+    SECTION("Disable an independent notification interface") {
+        disable_notification = true;
+    }
+    SECTION("Disable polling on a shared data and notification interface") {
+        disable_notification = true;
+        shared_interface = true;
+    }
+
+    Mockusb_host_Init();
+    usb_host_mock_dev_list_init();
+    REQUIRE(ESP_OK == test_cdc_acm_host_install(nullptr));
+    usb_host_device_addr_list_fill_Stub(usb_host_device_addr_list_fill_mock_callback);
+    usb_host_device_open_Stub(usb_host_device_open_mock_callback);
+    usb_host_device_close_Stub(usb_host_device_close_mock_callback);
+    usb_host_get_device_descriptor_Stub(usb_host_get_device_descriptor_mock_callback);
+    usb_host_get_active_config_descriptor_Stub(usb_host_get_active_config_descriptor_mock_callback);
+    usb_host_device_info_Stub(usb_host_device_info_mock_callback);
+    usb_host_transfer_alloc_Stub(usb_host_transfer_alloc_mock_callback);
+    usb_host_transfer_free_Stub(usb_host_transfer_free_mock_callback);
+
+    const auto *device_desc = reinterpret_cast<const usb_device_desc_t *>(shared_interface ? ch340_device_desc : stm32_device::dev_desc);
+    const auto *config_desc = reinterpret_cast<const usb_config_desc_t *>(shared_interface ? ch340_config_desc : stm32_device::cfg_desc);
+    REQUIRE(ESP_OK == usb_host_mock_add_device(5, device_desc, config_desc));
+    cdc_parsed_info_t info = {};
+    REQUIRE(ESP_OK == cdc_parse_interface_descriptor(device_desc, config_desc, 0, &info));
+    REQUIRE(info.notif_ep != nullptr);
+    CHECK((info.notif_intf == info.data_intf) == shared_interface);
+
+    std::vector<uint8_t> claimed_interfaces = {info.data_intf->bInterfaceNumber};
+    std::vector<uint8_t> expected_polls = {info.in_ep->bEndpointAddress};
+    if (!disable_notification) {
+        claimed_interfaces.push_back(info.notif_intf->bInterfaceNumber);
+        expected_polls.push_back(info.notif_ep->bEndpointAddress);
+    }
+    for (uint8_t interface_number : claimed_interfaces) {
+        usb_host_interface_claim_ExpectAndReturn(nullptr, nullptr, interface_number, 0, ESP_OK);
+        usb_host_interface_claim_IgnoreArg_client_hdl();
+        usb_host_interface_claim_IgnoreArg_dev_hdl();
+    }
+    static std::vector<uint8_t> submitted_endpoints;
+    submitted_endpoints.clear();
+    usb_host_transfer_submit_Stub([](usb_transfer_t *transfer, int) -> esp_err_t {
+        submitted_endpoints.push_back(transfer->bEndpointAddress);
+        return ESP_OK;
+    });
+
+    cdc_acm_dev_hdl_t dev = nullptr;
+    if (legacy_open) {
+        const cdc_acm_host_device_config_t config = {
+            .connection_timeout_ms = 1,
+            .out_buffer_size = 64,
+            .in_buffer_size = 64,
+            .event_cb = nullptr,
+            .data_cb = nullptr,
+            .user_arg = nullptr,
+        };
+        REQUIRE(ESP_OK == cdc_acm_host_open(device_desc->idVendor, device_desc->idProduct, 0, &config, &dev));
+    } else {
+        cdc_acm_host_open_config_t config = {};
+        config.vid = device_desc->idVendor;
+        config.pid = device_desc->idProduct;
+        config.dev_addr = 5;
+        config.connection_timeout_ms = 1;
+        config.out_buffer_size = 64;
+        config.in_buffer_size = 64;
+        if (disable_notification) {
+            config.disable_notification = true;
+        }
+        REQUIRE(ESP_OK == cdc_acm_host_open(&config, &dev));
+    }
+    CHECK(submitted_endpoints == expected_polls);
+
+    // EP0 requests remain usable even when the notification interface is not claimed.
+    usb_host_transfer_submit_control_ExpectAnyArgsAndReturn(ESP_OK);
+    usb_host_transfer_submit_control_AddCallback(usb_host_transfer_submit_control_success_mock_callback);
+    uint8_t unused_data = 0;
+    CHECK(ESP_OK == cdc_acm_host_send_custom_request(dev, 0x21, USB_CDC_REQ_SET_CONTROL_LINE_STATE,
+                                                     0, info.notif_intf->bInterfaceNumber, 0, &unused_data));
+
+    for (uint8_t endpoint : expected_polls) {
+        test_cdc_acm_reset_transfer_endpoint(endpoint);
+    }
+    for (uint8_t interface_number : claimed_interfaces) {
+        usb_host_interface_release_ExpectAndReturn(nullptr, nullptr, interface_number, ESP_OK);
+        usb_host_interface_release_IgnoreArg_client_hdl();
+        usb_host_interface_release_IgnoreArg_dev_hdl();
+    }
+    REQUIRE(ESP_OK == cdc_acm_host_close(dev));
+    REQUIRE(ESP_OK == test_cdc_acm_host_uninstall());
+    std::free(info.func);
+    Mockusb_host_Verify();
+    Mockusb_host_Destroy();
 }

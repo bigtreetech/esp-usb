@@ -111,4 +111,7 @@ typedef struct {
     cdc_acm_host_dev_callback_t event_cb; /*!< Device event callback. Can be NULL. */
     cdc_acm_data_callback_t data_cb;      /*!< Data RX callback. Can be NULL for write-only devices. */
     void *user_arg;                       /*!< User argument passed to both callbacks. */
+    bool disable_notification;            /*!< Disable interrupt notification transfers. Default: false.
+                                               A separate notification interface is not claimed, saving its host channel.
+                                               A notification endpoint sharing the data interface still occupies a channel. */
 } cdc_acm_host_open_config_t;
